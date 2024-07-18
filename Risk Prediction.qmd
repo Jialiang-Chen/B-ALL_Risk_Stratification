@@ -1,0 +1,576 @@
+---
+title: "Risk Prediction"
+format: html
+editor: visual
+---
+
+## some settings
+
+```{r}
+setwd("/Users/chenjialiang/Desktop/MSc AI for Medicine&Medical Research/Research Project")
+set.seed(22)
+
+library(openxlsx)
+library(dplyr)
+library(tidyr)
+library(caTools)
+library(mltools)
+library(data.table)
+library(glmnet)
+library(corrplot)
+library(PerformanceAnalytics)
+library(pROC) 
+library(survival)
+library(randomForestSRC)
+library(ggRandomForests)
+library(survminer)
+library(viridis)
+
+data_folder = "all_phase2_target_2018_pub"
+#out_folder = "Relapse_Clinical"
+out_folder = "Relapse_Clinical+Mutation"
+```
+
+## clinical data preparation
+
+```{r}
+# read sample and patient data
+sample <- read.delim(paste(data_folder, "data_clinical_sample.txt", sep = "/"), skip = 4)
+patient <- read.delim(paste(data_folder, "data_clinical_patient.txt", sep = "/"), skip = 4)
+
+# sample data cleaning
+sample$MOLECULAR_SUBTYPE[sample$MOLECULAR_SUBTYPE == 'None of above'] <- 'None of the above'
+
+# patient data cleaning
+patient_removed <- patient[which(patient$SEX == '' & patient$RACE == '' & patient$ETHNICITY == ''), ] # 6 patients are removed
+patient <- patient[-which(patient$SEX == '' & patient$RACE == '' & patient$ETHNICITY == ''), ] # 1545 patients left
+patient_removed_os <- patient[which(patient$OS_STATUS == '' | (is.na(patient$OS_MONTHS) & is.na(patient$OS_DAYS))), ] # 10 patients are removed
+patient <- patient[-which(patient$OS_STATUS == '' | (is.na(patient$OS_MONTHS) & is.na(patient$OS_DAYS))), ] # 1535 patients left
+patient$OS_MONTHS <- ifelse(is.na(patient$OS_MONTHS) & !is.na(patient$OS_DAYS), ceiling(patient$OS_DAYS/30), patient$OS_MONTHS) # convert os days to months if months na and days not na
+
+# merge clinical info in sample data with patient data
+patient_sample <- unique(sample[, c('PATIENT_ID'
+                                    , 'BONE_MARROW_SITE_OF_RELAPSE'
+                                    , 'CNS_SITE_OF_RELAPSE'
+                                    , 'TESTES_SITE_OF_RELAPSE'
+                                    , 'OTHER_SITE_OF_RELAPSE'
+                                    , 'ETV6_RUNX1_FUSION_STATUS'
+                                    , 'TRISOMY_4_10'
+                                    , 'MLL_STATUS'
+                                    , 'BCR_ABL1_STATUS'
+                                    , 'TCF3_PBX1_STATUS'
+                                    , 'DNA_INDEX'
+                                    , 'CELL_OF_ORIGIN'
+                                    , 'MOLECULAR_SUBTYPE'
+                                    , 'ONCOTREE_CODE'
+                                    #, 'ANALYSIS_COHORT' # not 1-1 relation
+                                    , 'CANCER_TYPE'
+                                    , 'CANCER_TYPE_DETAILED'
+                                    #, 'TMB_NONSYNONYMOUS' # not 1-1 relation
+)]) 
+
+data_combined <- patient |>
+  mutate(OS_STATUS_ = as.numeric(substr(OS_STATUS,1,1))) |>
+  inner_join(patient_sample, by = "PATIENT_ID") |>
+  mutate(RELAPSE = if_else(BONE_MARROW_SITE_OF_RELAPSE == "Yes" | CNS_SITE_OF_RELAPSE == "Yes" | TESTES_SITE_OF_RELAPSE == "Yes" | OTHER_SITE_OF_RELAPSE == "Yes", "Yes"
+                           , if_else(BONE_MARROW_SITE_OF_RELAPSE == "" & CNS_SITE_OF_RELAPSE == "" & TESTES_SITE_OF_RELAPSE == "" & OTHER_SITE_OF_RELAPSE == "", "Unknown", "No"))) |>
+  mutate(AGE_GROUP = if_else(AGE < 10, "<10", ">=10")) |>
+  mutate(MRD_STATUS = if_else(MRD_PERCENT_DAY_29 <= 0.01, "Negative", if_else(is.na(MRD_PERCENT_DAY_29), NA, "Positive"))) |>
+  mutate(CNS_STATUS = substr(CNS_STATUS, 1, 5 )) |>
+  mutate(DNA_INDEX_LEVEL = if_else(DNA_INDEX < 1, "<1", if_else(DNA_INDEX >= 1.16 & DNA_INDEX <= 1.6, "1.16-1.6", if_else(DNA_INDEX > 1.6, ">1.6", if_else(is.na(DNA_INDEX), NA, "1-1.16")))))
+
+data_combined$MOLECULAR_SUBTYPE[data_combined$MOLECULAR_SUBTYPE == ''] <- 'Unknown'
+
+# keep useful features for important feature missing check
+feature_list <- c('PATIENT_ID'
+                  , 'SEX'
+                  , 'ETHNICITY'
+                  , 'RACE'
+                  , 'AGE'
+                  , 'AGE_GROUP'
+                  , 'WBC'
+                  , 'CNS_STATUS'
+                  , 'TESTICULAR_INVOLVEMENT'
+                  , 'MRD_PERCENT_DAY_29'
+                  , 'MRD_STATUS'
+                  #, 'BM_DAY_8'
+                  #, 'BM_DAY_15'
+                  , 'BM_DAY_29'
+                  #, 'BM_DAY_43'
+                  , 'KARYOTYPE'
+                  , 'CONGENITAL_ABNORMALITY'
+                  , 'PROTOCOL'
+                  , 'ALTERNATE_THERAPY'
+                  , 'ALTERNATE_THERAPY_OTHER'
+                  , 'BONE_MARROW_SITE_OF_RELAPSE'
+                  , 'CNS_SITE_OF_RELAPSE'
+                  , 'TESTES_SITE_OF_RELAPSE'
+                  , 'OTHER_SITE_OF_RELAPSE'
+                  , 'FIRST_EVENT'
+                  , 'DAYS_TO_EVENT'
+                  , 'RELAPSE'
+                  , 'MOLECULAR_SUBTYPE'
+                  , 'BCR_ABL1_STATUS'
+                  , 'ETV6_RUNX1_FUSION_STATUS'
+                  , 'TRISOMY_4_10'
+                  , 'MLL_STATUS'
+                  , 'TCF3_PBX1_STATUS'
+                  , 'DNA_INDEX'
+                  , 'DNA_INDEX_LEVEL'
+                  , 'OS_MONTHS'
+                  , 'OS_STATUS_'
+)
+
+data_combined <- data_combined[ , feature_list]
+
+# remove patient if important features missing
+data_combined <- data_combined |>
+  mutate(MISSING_COUNT = rowSums(is.na(data_combined) | data_combined == ""))
+
+data_combined <- data_combined |>
+  filter(MISSING_COUNT < 10
+         , !is.na(DNA_INDEX)
+         , !is.na(MRD_PERCENT_DAY_29)
+         , !is.na(BM_DAY_29)
+         , CNS_STATUS != '.'
+         , !(BCR_ABL1_STATUS == 'Unknown' & ETV6_RUNX1_FUSION_STATUS == 'Unknown' & TRISOMY_4_10 == 'Unknown' & MLL_STATUS == 'Unknown' & TCF3_PBX1_STATUS == 'Unknown'))
+
+# write.xlsx(data_combined, "data_combined.xlsx")
+
+# keep useful features only
+feature_list <- c('PATIENT_ID'
+                  , 'SEX'
+                  , 'ETHNICITY'
+                  , 'AGE_GROUP'
+                  , 'WBC'
+                  , 'CNS_STATUS'
+                  , 'MRD_STATUS'
+                  , 'BM_DAY_29'
+                  , 'PROTOCOL'
+                  , 'FIRST_EVENT'
+                  , 'DAYS_TO_EVENT'
+                  # , 'RELAPSE'
+                  , 'MOLECULAR_SUBTYPE'
+                  , 'BCR_ABL1_STATUS'
+                  , 'ETV6_RUNX1_FUSION_STATUS'
+                  , 'TRISOMY_4_10'
+                  , 'MLL_STATUS'
+                  , 'TCF3_PBX1_STATUS'
+                  , 'DNA_INDEX_LEVEL'
+)
+
+clinical <- data_combined[ , feature_list]
+
+# keep patients who have first event = relapse or none
+clinical <- clinical |>
+  filter(FIRST_EVENT %in% c('Relapse', 'None')) |>
+  mutate(RELAPSE_5_YR = if_else(FIRST_EVENT == 'Relapse' & DAYS_TO_EVENT/365 <= 5, 1, 0)) |>
+  mutate(EVENT_RELAPSE = if_else(FIRST_EVENT == 'Relapse', 1, 0))
+
+```
+
+## add mutation data
+
+```{r}
+# read mutation data
+mutation <- read.delim(paste0(data_folder, "/data_mutations.txt"))
+
+# handle the shifted data
+mutation <- mutation |>
+  mutate(Variant_Classification = if_else(Center != "TARGET", Consequence, Variant_Classification))
+  
+mutation <- mutation |>
+  mutate(PATIENT_ID = substr(Tumor_Sample_Barcode, 1, 16)) |>
+  mutate(SAMPLE_ORDER = as.numeric(substr(Tumor_Sample_Barcode, 18, nchar(Tumor_Sample_Barcode)))) |>
+  group_by(PATIENT_ID) |>
+  filter(SAMPLE_ORDER == min(SAMPLE_ORDER)) |>
+  #select(Hugo_Symbol, Consequence, PATIENT_ID)
+  select(Hugo_Symbol, Variant_Classification, PATIENT_ID)
+
+# check if any duplicates and remove
+mutation[duplicated(mutation), ]
+mutation <- mutation[!duplicated(mutation), ]
+
+# remove synonymous variant and check variants distribution
+#mutation <- filter(mutation, Consequence != "synonymous_variant")
+mutation <- filter(mutation, Variant_Classification != "Silent")
+table(mutation$Variant_Classification)
+```
+
+## feature preparation
+
+### clinical feature
+
+```{r}
+# clinical feature 
+#str(clinical)
+clinical$SEX <- factor(clinical$SEX, levels = c("Female", "Male"))
+clinical$ETHNICITY <- factor(clinical$ETHNICITY, levels = c("Not Hispanic or Latino", "Hispanic or Latino", "Unknown"))
+clinical$AGE_GROUP <- factor(clinical$AGE_GROUP, levels = c(">=10", "<10"))
+clinical$CNS_STATUS <- factor(clinical$CNS_STATUS, levels = c("CNS 1", "CNS 2", "CNS 3"), ordered = TRUE)
+clinical$PROTOCOL <- factor(clinical$PROTOCOL)
+clinical$DNA_INDEX_LEVEL <- factor(clinical$DNA_INDEX_LEVEL)
+
+clinical$MRD_STATUS <- if_else(clinical$MRD_STATUS == "Positive", 1, 0)
+#clinical$RELAPSE <- if_else(clinical$RELAPSE == "Yes", 1, 0)
+clinical$BCR_ABL1_STATUS <- if_else(clinical$BCR_ABL1_STATUS == "Positive", 1, 0)
+clinical$ETV6_RUNX1_FUSION_STATUS <- if_else(clinical$ETV6_RUNX1_FUSION_STATUS == "Positive", 1, 0)
+clinical$TRISOMY_4_10 <- if_else(clinical$TRISOMY_4_10 == "Positive", 1, 0)
+clinical$MLL_STATUS <- if_else(clinical$MLL_STATUS == "Positive", 1, 0)
+clinical$TCF3_PBX1_STATUS <- if_else(clinical$TCF3_PBX1_STATUS == "Positive", 1, 0)
+
+clinical$MOLECULAR_SUBTYPE <- factor(clinical$MOLECULAR_SUBTYPE)
+clinical <- one_hot(as.data.table(clinical), cols = c("MOLECULAR_SUBTYPE"))
+
+#str(clinical)
+```
+
+### mutation feature
+
+```{r}
+# mutation feature
+# only keep Missense_Mutation
+mis_mutation <- mutation |>
+  filter(Variant_Classification == "Missense_Mutation") |>
+  select(-Variant_Classification) |>
+  rename("mis_mutation_gene" = "Hugo_Symbol") |>
+  mutate(mutation = 1)
+
+mis_mutation.wider <- mis_mutation |>
+  pivot_wider(names_from = mis_mutation_gene, values_from = mutation, values_fill = 0)
+
+# merge with all patient IDs and replace NA with 0
+patient_id <- select(clinical, PATIENT_ID)
+mis_mutation.wider <- merge(mis_mutation.wider, patient_id, all.y = TRUE)
+mis_mutation.wider[is.na(mis_mutation.wider)] <- 0
+```
+
+## merge data
+
+```{r}
+# data <- clinical
+
+# merge clinical with mutation data
+data <- merge(clinical, mis_mutation.wider, by = "PATIENT_ID")
+
+# remove meaningless molecular subtypes
+data <- select(data, 
+               -c("MOLECULAR_SUBTYPE_None of the above", "MOLECULAR_SUBTYPE_TCF3-HLF"))
+```
+
+## train test split
+
+```{r}
+split <- sample.split(data$RELAPSE_5_YR, SplitRatio = 0.7)
+train <- as.data.frame(subset(data, split == TRUE))
+test <- as.data.frame(subset(data, split == FALSE))
+
+col_remove <- c("PATIENT_ID", "RELAPSE_5_YR", "EVENT_RELAPSE", "FIRST_EVENT", "DAYS_TO_EVENT")
+# 
+# x_train <- data.frame(train[,!(names(train) %in% col_remove)])
+# x_test <- data.frame(test[,!(names(test) %in% col_remove)])
+# 
+# y_train <- Surv(train$OS_MONTHS, train$OS_STATUS_)
+# y_test <- Surv(test$OS_MONTHS, test$OS_STATUS_)
+
+# train <- data.frame(lapply(train, factor))[,!(names(train) %in% c("PATIENT_ID"))]
+# test <- data.frame(lapply(test, factor))[,!(names(test) %in% c("PATIENT_ID", "OS_MONTHS", "OS_STATUS_"))]
+
+train_ <- data.frame(lapply(train, factor))
+train_$status <- train$RELAPSE_5_YR
+train_$time <- train$DAYS_TO_EVENT
+train_ <- train_[, !(names(train_) %in% col_remove)]
+#str(train_)
+
+test_ <- data.frame(lapply(test, factor))
+test_$status <- test$RELAPSE_5_YR
+test_$time <- test$DAYS_TO_EVENT
+test_ <- test_[, !(names(test_) %in% col_remove)]
+```
+
+## random forest model
+
+### train the forest
+
+```{r}
+# train the forest 
+obj <- rfsrc(Surv(time, status) ~ ., data = train_, ntree = 1000, importance = TRUE) 
+obj
+```
+
+### prediction
+
+```{r}
+# prediction
+pred <- predict(obj, test_)
+pred
+```
+
+### extract predicted results
+
+```{r}
+# survival functions (IB and OOB)
+obj_surv <- obj$survival.oob
+obj_surv <- as.data.frame(cbind(train$PATIENT_ID, obj_surv))
+
+pred_surv <- pred$survival
+pred_surv <- as.data.frame(cbind(test$PATIENT_ID, pred_surv))
+
+# cumulative hazard function (IB and OOB)
+obj_chf <- obj$chf.oob
+obj_chf <- as.data.frame(cbind(train$PATIENT_ID, obj_chf))
+
+pred_chf <- pred$chf
+pred_chf <- as.data.frame(cbind(test$PATIENT_ID, pred_chf))
+```
+
+### some plots
+
+```{r}
+# plot
+par(cex.lab = 0.01, cex.axis = 1.5, cex.main = 1.5, cex.sub = 1.5)
+plot.rfsrc(obj, plots.one.page = FALSE)
+```
+
+```{r}
+gg_dta <- gg_vimp(obj, nvar = 50)
+plot(gg_dta)
+```
+
+```{r}
+# par(mar=c(4,4,3,3))
+# plot.variable.rfsrc(obj, plots.per.page = 3)
+# plot.variable.rfsrc(obj, plots.per.page = 3, surv.type = "surv")
+# plot.variable.rfsrc(obj, plots.per.page = 3, surv.type = "chf")
+```
+
+```{r}
+#par(mar=c(4,4,2,2))
+plot.survival.rfsrc(obj)
+plot.survival.rfsrc(pred)
+```
+
+### feature importance
+
+```{r}
+# feature importance produced by model
+importance <- as.data.frame(obj$importance)
+importance['feature'] <- rownames(importance)
+rownames(importance) <- NULL
+```
+
+```{r}
+# feature importance based on minimal depth
+var.select <- var.select.rfsrc(obj, method = "md")
+```
+
+### pairwise interaction
+
+```{r}
+# find pairwise interaction
+interaction <- find.interaction.rfsrc(obj, method = "vimp", nvar = 10)
+interaction <- as.data.frame(interaction)
+interaction['feature'] <- rownames(interaction)
+rownames(interaction) <- NULL
+write.xlsx(interaction, paste(out_folder, "rf_interaction.xlsx", sep = '/'))
+```
+
+## identify patient groups
+
+```{r}
+# patient groups
+surv <- rbind(obj_surv, pred_surv)
+colnames(surv) <- c("PATIENT_ID", obj$time.interest)
+```
+
+```{r}
+# graph comparing groups
+surv_grp <- surv |>
+  mutate(Group = if_else(surv[,length(obj$time.interest)] > 0.8, "Low", if_else(surv[,length(obj$time.interest)] > 0.5, "Moderate", "High"))) |>
+  mutate(Color = if_else(surv[,length(obj$time.interest)] > 0.8, "#8b97b4", if_else(surv[,length(obj$time.interest)] > 0.5, "#a6c668", "#536a26")))
+
+col <- colnames(surv)[-1]
+
+plot(as.numeric(col), surv[1,-1], type = 'n',
+     pch = 16,
+     col = "black",
+     xlab = "Time(Days)",
+     ylab = "Prob",
+     main = "Predicted No Relapse Probabilities",
+     ylim = c(0, 1))
+
+for (i in 2:ncol(surv)) {
+  points(as.numeric(col), surv[i,-1], pch = 15, col = surv_grp$Color[i], cex = 0.25)
+}
+
+table(surv_grp$Group)
+
+```
+
+```{r}
+# graph comparing groups
+surv_grp <- surv |>
+  mutate(Group = if_else(surv[,length(obj$time.interest)] > 0.8, "Low", if_else(surv[,length(obj$time.interest)] > 0.5, "Moderate", "High"))) |>
+  mutate(Color = if_else(surv[,length(obj$time.interest)] > 0.8, "#8b97b4", if_else(surv[,length(obj$time.interest)] > 0.5, "#a6c668", "#536a26")))
+
+plot(as.numeric(1:(ncol(surv)-1)), surv[1,-1], type = 'n',
+     pch = 16,
+     col = "black",
+     xlab = "Ranked Time",
+     ylab = "Prob",
+     main = "Predicted No Relapse Probabilities",
+     ylim = c(0, 1))
+
+for (i in 2:ncol(surv)) {
+  points(as.numeric(1:(ncol(surv)-1)), surv[i,-1], pch = 15, col = surv_grp$Color[i], cex = 0.25)
+}
+
+legend(x = "bottomleft", legend=c("High", "Moderate", "Low"), 
+       fill = c("#536a26","#a6c668", "#8b97b4"), 
+       title = "Risk Groups",
+       bty = "n",
+       text.font = 3)
+
+table(surv_grp$Group)
+```
+
+```{r}
+# graph comparing actual status
+surv_status <- rbind(data.frame(status = train_$status), data.frame(status = test_$status))
+surv_status$Color <- if_else(surv_status==1, "#fb9ccd", "#a6c699")
+
+plot(as.numeric(1:(ncol(surv)-1)), surv[1,-1], type = 'n',
+     pch = 16,
+     col = "black",
+     xlab = "Ranked Time",
+     ylab = "Prob",
+     main = "Predicted No Relapse Probabilities",
+     ylim = c(0, 1))
+
+for (i in 2:ncol(surv)) {
+  points(as.numeric(1:(ncol(surv)-1)), surv[i,-1], pch = 15, col = surv_status$Color[i], cex = 0.25)
+}
+
+legend(x = "bottomleft", legend=c("Yes", "No"), 
+       fill = c("#fb9ccd","#a6c699"), 
+       title = "If had relapse",
+       bty = "n",
+       text.font = 3)
+
+```
+
+```{r}
+# understand features of each group
+group_label <- surv_grp[,names(surv_grp) %in% c("PATIENT_ID", "Group")]
+data_group <- cbind(rbind(train_, test_), group_label)
+
+cox_fit <- survfit(Surv(time, status) ~ Group, data = data_group)
+
+ggsurvplot(cox_fit, conf.int=TRUE, pval=TRUE, risk.table=TRUE
+           , risk.table.height=.3
+           , xlab = "Time (Day)"
+           , title="Predicted Relapse Risk Group")
+
+```
+
+```{r}
+p <- data_group |>
+  mutate(across(where(is.factor), ~ as.numeric(as.character(.)))) |>
+  ggplot(aes(x = Group, y = WBC, fill = Group)) + 
+  geom_violin() +
+  geom_boxplot(width=0.1) +
+  scale_fill_viridis(discrete = TRUE, alpha=0.6, option="A") +
+  geom_jitter(color = "black", size=0.4, alpha=0.9) +
+  #theme_ipsum() +
+  theme(legend.position="none") +
+  ggtitle("Predicted Risk Groups") +
+  xlab("") +
+  scale_y_log10() +
+  scale_x_discrete(limits = c("High", "Moderate", "Low"))
+p
+```
+
+```{r}
+p <- data_group |>
+  mutate(across(where(is.factor), ~ as.numeric(as.character(.)))) |>
+  ggplot(aes(x = Group, y = BM_DAY_29, fill = Group)) + 
+  geom_violin() +
+  geom_boxplot(width=0.1) +
+  scale_fill_viridis(discrete = TRUE, alpha=0.6, option="A") +
+  geom_jitter(color = "black", size=0.4, alpha=0.9) +
+  #theme_ipsum() +
+  theme(legend.position="none") +
+  ggtitle("Predicted Risk Groups") +
+  xlab("") +
+  scale_y_continuous(trans = "sqrt") +
+  scale_x_discrete(limits = c("High", "Moderate", "Low"))
+p
+```
+
+```{r}
+p <- data_group |>
+  mutate(across(where(is.factor), ~ as.numeric(as.character(.)))) |>
+  ggplot(aes(x = Group, y = BM_DAY_29, fill = Group)) + 
+  geom_violin() +
+  geom_boxplot(width=0.1) +
+  scale_fill_viridis(discrete = TRUE, alpha=0.6, option="A") +
+  geom_jitter(color = "black", size=0.4, alpha=0.9) +
+  #theme_ipsum() +
+  theme(legend.position="none") +
+  ggtitle("Predicted Risk Groups") +
+  xlab("") +
+  scale_y_continuous(trans = "sqrt")
+p
+```
+
+```{r}
+# mean summary
+summary_group_mean <- data_group |>
+  select(-SEX, -ETHNICITY, -AGE_GROUP, -CNS_STATUS, -PROTOCOL) |>
+  mutate(across(where(is.factor), ~ as.numeric(as.character(.)))) |>
+  group_by(Group) |>
+  summarise(across(where(is.numeric), mean, .names = "mean_{col}")) |>
+  t() |>
+  na.omit() |>
+  as.data.frame() 
+
+colnames(summary_group_mean) <- summary_group_mean[1,]
+summary_group_mean <- summary_group_mean[-1,]
+summary_group_mean <- summary_group_mean |>
+  mutate(across(everything(), as.numeric)) 
+summary_group_mean$rowsum <- rowSums(summary_group_mean)
+summary_group_mean <- summary_group_mean[summary_group_mean$rowsum != 0,]
+
+summary_group_mean <- summary_group_mean |>
+  select(-rowsum) |>
+  t() |>
+  as.data.frame()
+
+
+# sum summary
+summary_group_sum <- data_group |>
+  select(-SEX, -ETHNICITY, -AGE_GROUP, -CNS_STATUS, -PROTOCOL) |>
+  mutate(across(where(is.factor), ~ as.numeric(as.character(.)))) |>
+  group_by(Group) |>
+  summarise(across(where(is.numeric), sum, .names = "sum_{col}")) |>
+  t() |>
+  na.omit() |>
+  as.data.frame() 
+
+colnames(summary_group_sum) <- summary_group_sum[1,]
+summary_group_sum <- summary_group_sum[-1,]
+summary_group_sum <- summary_group_sum |>
+  mutate(across(everything(), as.numeric)) 
+summary_group_sum$rowsum <- rowSums(summary_group_sum)
+summary_group_sum <- summary_group_sum[summary_group_sum$rowsum != 0,]
+
+summary_group_sum <- summary_group_sum |>
+  select(-rowsum) |>
+  t() |>
+  as.data.frame()
+
+summary_group <- cbind(Group = rownames(summary_group_mean), summary_group_mean, summary_group_sum, row.names = NULL)
+
+write.xlsx(summary_group, paste(out_folder, "summary_group.xlsx", sep = '/'))
+write.xlsx(data_group, paste(out_folder, "data_group.xlsx", sep = '/'))
+```

@@ -1,0 +1,782 @@
+---
+title: "Risk Prediction_Voting Ensemble"
+format: html
+editor: visual
+---
+
+# some settings
+
+```{r}
+setwd("/Users/chenjialiang/Desktop/MSc AI for Medicine&Medical Research/Research Project")
+set.seed(22)
+
+library(openxlsx)
+library(dplyr)
+library(tidyr)
+library(caTools)
+library(mltools)
+library(data.table)
+library(glmnet)
+library(corrplot)
+library(pheatmap)
+library(PerformanceAnalytics)
+library(pROC) 
+library(survival)
+library(randomForestSRC)
+library(ggRandomForests)
+library(survminer)
+library(viridis)
+library(survcomp)
+
+data_folder = "all_phase2_target_2018_pub"
+#out_folder = "Relapse_Clinical"
+out_folder = "Relapse_Voting Ensemble"
+```
+
+# clinical data preparation
+
+```{r}
+# read sample and patient data
+sample <- read.delim(paste(data_folder, "data_clinical_sample.txt", sep = "/"), skip = 4)
+patient <- read.delim(paste(data_folder, "data_clinical_patient.txt", sep = "/"), skip = 4)
+
+# sample data cleaning
+sample$MOLECULAR_SUBTYPE[sample$MOLECULAR_SUBTYPE == 'None of above'] <- 'None of the above'
+
+# patient data cleaning
+patient_removed <- patient[which(patient$SEX == '' & patient$RACE == '' & patient$ETHNICITY == ''), ] # 6 patients are removed
+patient <- patient[-which(patient$SEX == '' & patient$RACE == '' & patient$ETHNICITY == ''), ] # 1545 patients left
+patient_removed_os <- patient[which(patient$OS_STATUS == '' | (is.na(patient$OS_MONTHS) & is.na(patient$OS_DAYS))), ] # 10 patients are removed
+patient <- patient[-which(patient$OS_STATUS == '' | (is.na(patient$OS_MONTHS) & is.na(patient$OS_DAYS))), ] # 1535 patients left
+patient$OS_MONTHS <- ifelse(is.na(patient$OS_MONTHS) & !is.na(patient$OS_DAYS), ceiling(patient$OS_DAYS/30), patient$OS_MONTHS) # convert os days to months if months na and days not na
+
+# merge clinical info in sample data with patient data
+patient_sample <- unique(sample[, c('PATIENT_ID'
+                                    , 'BONE_MARROW_SITE_OF_RELAPSE'
+                                    , 'CNS_SITE_OF_RELAPSE'
+                                    , 'TESTES_SITE_OF_RELAPSE'
+                                    , 'OTHER_SITE_OF_RELAPSE'
+                                    , 'ETV6_RUNX1_FUSION_STATUS'
+                                    , 'TRISOMY_4_10'
+                                    , 'MLL_STATUS'
+                                    , 'BCR_ABL1_STATUS'
+                                    , 'TCF3_PBX1_STATUS'
+                                    , 'DNA_INDEX'
+                                    , 'CELL_OF_ORIGIN'
+                                    , 'MOLECULAR_SUBTYPE'
+                                    , 'ONCOTREE_CODE'
+                                    #, 'ANALYSIS_COHORT' # not 1-1 relation
+                                    , 'CANCER_TYPE'
+                                    , 'CANCER_TYPE_DETAILED'
+                                    #, 'TMB_NONSYNONYMOUS' # not 1-1 relation
+)]) 
+
+data_combined <- patient |>
+  mutate(OS_STATUS_ = as.numeric(substr(OS_STATUS,1,1))) |>
+  inner_join(patient_sample, by = "PATIENT_ID") |>
+  mutate(RELAPSE = if_else(BONE_MARROW_SITE_OF_RELAPSE == "Yes" | CNS_SITE_OF_RELAPSE == "Yes" | TESTES_SITE_OF_RELAPSE == "Yes" | OTHER_SITE_OF_RELAPSE == "Yes", "Yes"
+                           , if_else(BONE_MARROW_SITE_OF_RELAPSE == "" & CNS_SITE_OF_RELAPSE == "" & TESTES_SITE_OF_RELAPSE == "" & OTHER_SITE_OF_RELAPSE == "", "Unknown", "No"))) |>
+  mutate(AGE_GROUP = if_else(AGE < 10, "<10", ">=10")) |>
+  mutate(MRD_STATUS = if_else(MRD_PERCENT_DAY_29 <= 0.01, "Negative", if_else(is.na(MRD_PERCENT_DAY_29), NA, "Positive"))) |>
+  mutate(CNS_STATUS = substr(CNS_STATUS, 1, 5 )) |>
+  mutate(DNA_INDEX_LEVEL = if_else(DNA_INDEX < 1, "<1", if_else(DNA_INDEX >= 1.16 & DNA_INDEX <= 1.6, "1.16-1.6", if_else(DNA_INDEX > 1.6, ">1.6", if_else(is.na(DNA_INDEX), NA, "1-1.16")))))
+
+data_combined$MOLECULAR_SUBTYPE[data_combined$MOLECULAR_SUBTYPE == ''] <- 'Unknown'
+
+# keep useful features for important feature missing check
+feature_list <- c('PATIENT_ID'
+                  , 'SEX'
+                  , 'ETHNICITY'
+                  , 'RACE'
+                  , 'AGE'
+                  , 'AGE_GROUP'
+                  , 'WBC'
+                  , 'CNS_STATUS'
+                  , 'TESTICULAR_INVOLVEMENT'
+                  , 'MRD_PERCENT_DAY_29'
+                  , 'MRD_STATUS'
+                  #, 'BM_DAY_8'
+                  #, 'BM_DAY_15'
+                  , 'BM_DAY_29'
+                  #, 'BM_DAY_43'
+                  , 'KARYOTYPE'
+                  , 'CONGENITAL_ABNORMALITY'
+                  , 'PROTOCOL'
+                  , 'ALTERNATE_THERAPY'
+                  , 'ALTERNATE_THERAPY_OTHER'
+                  , 'BONE_MARROW_SITE_OF_RELAPSE'
+                  , 'CNS_SITE_OF_RELAPSE'
+                  , 'TESTES_SITE_OF_RELAPSE'
+                  , 'OTHER_SITE_OF_RELAPSE'
+                  , 'FIRST_EVENT'
+                  , 'DAYS_TO_EVENT'
+                  , 'RELAPSE'
+                  , 'MOLECULAR_SUBTYPE'
+                  , 'BCR_ABL1_STATUS'
+                  , 'ETV6_RUNX1_FUSION_STATUS'
+                  , 'TRISOMY_4_10'
+                  , 'MLL_STATUS'
+                  , 'TCF3_PBX1_STATUS'
+                  , 'DNA_INDEX'
+                  , 'DNA_INDEX_LEVEL'
+                  , 'OS_MONTHS'
+                  , 'OS_STATUS_'
+)
+
+data_combined <- data_combined[ , feature_list]
+
+# remove patient if important features missing
+data_combined <- data_combined |>
+  mutate(MISSING_COUNT = rowSums(is.na(data_combined) | data_combined == ""))
+
+data_combined <- data_combined |>
+  filter(MISSING_COUNT < 10
+         , !is.na(DNA_INDEX)
+         , !is.na(MRD_PERCENT_DAY_29)
+         , !is.na(BM_DAY_29)
+         , CNS_STATUS != '.'
+         , !(BCR_ABL1_STATUS == 'Unknown' & ETV6_RUNX1_FUSION_STATUS == 'Unknown' & TRISOMY_4_10 == 'Unknown' & MLL_STATUS == 'Unknown' & TCF3_PBX1_STATUS == 'Unknown'))
+
+# write.xlsx(data_combined, "data_combined.xlsx")
+
+# keep useful features only
+feature_list <- c('PATIENT_ID'
+                  , 'SEX'
+                  , 'ETHNICITY'
+                  , 'AGE_GROUP'
+                  , 'WBC'
+                  , 'CNS_STATUS'
+                  , 'MRD_STATUS'
+                  , 'BM_DAY_29'
+                  , 'PROTOCOL'
+                  , 'FIRST_EVENT'
+                  , 'DAYS_TO_EVENT'
+                  , 'OS_STATUS_'
+                  # , 'RELAPSE'
+                  , 'MOLECULAR_SUBTYPE'
+                  , 'BCR_ABL1_STATUS'
+                  , 'ETV6_RUNX1_FUSION_STATUS'
+                  , 'TRISOMY_4_10'
+                  , 'MLL_STATUS'
+                  , 'TCF3_PBX1_STATUS'
+                  , 'DNA_INDEX_LEVEL'
+)
+
+clinical <- data_combined[ , feature_list]
+
+# keep patients who have first event = relapse or none
+clinical <- clinical |>
+  filter(FIRST_EVENT %in% c('Relapse', 'None')) |>
+  mutate(RELAPSE_5_YR = if_else(FIRST_EVENT == 'Relapse' & DAYS_TO_EVENT/365 <= 5, 1, 0)) |>
+  mutate(EVENT_RELAPSE = if_else(FIRST_EVENT == 'Relapse', 1, 0))
+
+```
+
+# add mutation data
+
+```{r}
+# read mutation data
+mutation <- read.delim(paste0(data_folder, "/data_mutations.txt"))
+
+# handle the shifted data
+mutation <- mutation |>
+  mutate(Variant_Classification = if_else(Center != "TARGET", Consequence, Variant_Classification))
+  
+mutation <- mutation |>
+  mutate(PATIENT_ID = substr(Tumor_Sample_Barcode, 1, 16)) |>
+  mutate(SAMPLE_ORDER = as.numeric(substr(Tumor_Sample_Barcode, 18, nchar(Tumor_Sample_Barcode)))) |>
+  group_by(PATIENT_ID) |>
+  filter(SAMPLE_ORDER == min(SAMPLE_ORDER)) |>
+  #select(Hugo_Symbol, Consequence, PATIENT_ID)
+  select(Hugo_Symbol, Variant_Classification, PATIENT_ID)
+
+# check if any duplicates and remove
+mutation[duplicated(mutation), ]
+mutation <- mutation[!duplicated(mutation), ]
+
+# remove synonymous variant and check variants distribution
+#mutation <- filter(mutation, Consequence != "synonymous_variant")
+mutation <- filter(mutation, Variant_Classification != "Silent")
+table(mutation$Variant_Classification)
+```
+
+# add cna data
+
+```{r}
+cna <- read.delim(paste0(data_folder, "/data_cna.txt"))
+gene_names <- cna$Hugo_Symbol
+cna <- as.data.frame(t(cna[, -c(1, 2)]))
+colnames(cna) <- gene_names
+
+# transpose
+cna$SAMPLE_ID <- rownames(cna)
+rownames(cna) <- NULL
+cna <- relocate(cna, SAMPLE_ID, .before = WASH7P)
+
+# check duplicate genes
+cna[0 , which(duplicated(names(cna)))]
+
+# remove duplicate genes
+cna <- cna[!duplicated(colnames(cna))]
+
+#write.xlsx(cna, "cna_clean.xlsx")
+
+# for each patient, keep the oldest data
+cna <- cna |>
+  mutate(PATIENT_ID = gsub("\\.", "-", substr(SAMPLE_ID, 1, 16))) |>
+  mutate(SAMPLE_ORDER = as.numeric(substr(SAMPLE_ID, 18, nchar(SAMPLE_ID)))) |>
+  relocate(PATIENT_ID, .before = SAMPLE_ID) |>
+  relocate(SAMPLE_ORDER, .after = SAMPLE_ID) |>
+  select(-SAMPLE_ID) |>
+  group_by(PATIENT_ID) |>
+  filter(SAMPLE_ORDER == min(SAMPLE_ORDER)) |>
+  distinct()
+
+```
+
+# feature preparation
+
+## clinical feature
+
+```{r}
+# clinical feature 
+#str(clinical)
+clinical$SEX <- factor(clinical$SEX, levels = c("Female", "Male"))
+clinical$ETHNICITY <- factor(clinical$ETHNICITY, levels = c("Not Hispanic or Latino", "Hispanic or Latino", "Unknown"))
+clinical$AGE_GROUP <- factor(clinical$AGE_GROUP, levels = c(">=10", "<10"))
+clinical$CNS_STATUS <- factor(clinical$CNS_STATUS, levels = c("CNS 1", "CNS 2", "CNS 3"), ordered = TRUE)
+clinical$PROTOCOL <- factor(clinical$PROTOCOL)
+clinical$DNA_INDEX_LEVEL <- factor(clinical$DNA_INDEX_LEVEL)
+
+clinical$MRD_STATUS <- if_else(clinical$MRD_STATUS == "Positive", 1, 0)
+#clinical$RELAPSE <- if_else(clinical$RELAPSE == "Yes", 1, 0)
+clinical$BCR_ABL1_STATUS <- if_else(clinical$BCR_ABL1_STATUS == "Positive", 1, 0)
+clinical$ETV6_RUNX1_FUSION_STATUS <- if_else(clinical$ETV6_RUNX1_FUSION_STATUS == "Positive", 1, 0)
+clinical$TRISOMY_4_10 <- if_else(clinical$TRISOMY_4_10 == "Positive", 1, 0)
+clinical$MLL_STATUS <- if_else(clinical$MLL_STATUS == "Positive", 1, 0)
+clinical$TCF3_PBX1_STATUS <- if_else(clinical$TCF3_PBX1_STATUS == "Positive", 1, 0)
+
+# group molecular subtypes
+#clinical$MOLECULAR_SUBTYPE[clinical$MOLECULAR_SUBTYPE %in% c("None of the above")] <- "Unknown"
+clinical$MOLECULAR_SUBTYPE[clinical$MOLECULAR_SUBTYPE %in% c("Hyperdiploidy without trisomy of both chromsomes 4 and 10", "Hyperdiploid; status of 4 and 10 unknown", "Hypodiploid")] <- "Hyperdiploidy"
+
+clinical$MOLECULAR_SUBTYPE <- factor(clinical$MOLECULAR_SUBTYPE)
+clinical <- one_hot(as.data.table(clinical), cols = c("MOLECULAR_SUBTYPE"))
+
+```
+
+## mutation feature
+
+```{r}
+gene_panel <- c("NRAS", "KRAS", "PTPN11", "CREBBP", "TP53", "WHSC1", "FLT3", "HLA-C",
+                "GNB1", "PBX1", "PAX5")
+
+# only keep Missense_Mutation for the gene panel
+mis_mutation <- mutation |>
+  filter(Variant_Classification == "Missense_Mutation") |>
+  select(-Variant_Classification) |>
+  rename("mis_mutation_gene" = "Hugo_Symbol") |>
+  mutate(mutation = 1) 
+
+mis_mutation.wider <- mis_mutation |>
+  pivot_wider(names_from = mis_mutation_gene, values_from = mutation, values_fill = 0) |>
+  select(PATIENT_ID, all_of(gene_panel))
+
+colnames(mis_mutation.wider)[-1] <- paste('MUT', colnames(mis_mutation.wider)[-1], sep = '_')
+
+```
+
+## cna features
+
+```{r}
+cna_panel <- c("CDKN2A", "CDKN2B", "IKZF1", "ETV6", "RB1", "BTG1", "PAX5")
+
+# only keep data for cna panel
+cna.wider <- cna |>
+  select(PATIENT_ID, all_of(cna_panel))
+
+colnames(cna.wider)[-1] <- paste('CNA', colnames(cna.wider)[-1], sep = '_')
+
+```
+
+# merge data
+
+```{r}
+data <- merge(clinical, mis_mutation.wider, by = "PATIENT_ID", all.x = TRUE)
+data <- merge(data, cna.wider, by = "PATIENT_ID", all.x = TRUE)
+
+# remove meaningless molecular subtypes
+# data <- select(data, 
+#                -c("MOLECULAR_SUBTYPE_Unknown", "MOLECULAR_SUBTYPE_TCF3-HLF"))
+# clinical <- select(clinical, 
+#                -c("MOLECULAR_SUBTYPE_Unknown", "MOLECULAR_SUBTYPE_TCF3-HLF"))
+
+data <- select(data, 
+               -c("MOLECULAR_SUBTYPE_None of the above", "MOLECULAR_SUBTYPE_TCF3-HLF"))
+clinical <- select(clinical, 
+               -c("MOLECULAR_SUBTYPE_None of the above", "MOLECULAR_SUBTYPE_TCF3-HLF"))
+
+# data_2: patients with clinical+mutation+cna data
+data_2_list <- merge(clinical, mis_mutation.wider, by = "PATIENT_ID")
+data_2_list <- merge(data_2_list, cna.wider, by = "PATIENT_ID")
+data_2_list <- data_2_list$PATIENT_ID
+
+data_2 <- data[data$PATIENT_ID %in% data_2_list]
+
+# data_1: patients with clinical data only
+data_1 <- clinical
+
+```
+
+# train test split
+
+```{r}
+col_remove <- c("PATIENT_ID", "RELAPSE_5_YR", "EVENT_RELAPSE", "FIRST_EVENT", "DAYS_TO_EVENT", "OS_STATUS_")
+
+train_test_split <- function(data, ratio = 0.7){
+  split <- sample.split(data$RELAPSE_5_YR, SplitRatio = ratio)
+  train <- as.data.frame(subset(data, split == TRUE))
+  test <- as.data.frame(subset(data, split == FALSE))
+  
+  process <- function(data_split){
+    data_split_ <- data.frame(lapply(data_split, factor))
+    data_split_$status <- data_split$RELAPSE_5_YR
+    data_split_$time <- data_split$DAYS_TO_EVENT
+    data_split_ <- data_split_[, !(names(data_split_) %in% col_remove)]
+    return(data_split_)
+  }
+  
+  train_ <- process(train)
+  test_ <- process(test)
+  
+  return(list(train = train_, test = test_))
+  
+}
+
+train_1_ <- train_test_split(data_1)$train
+test_1_ <- train_test_split(data_1)$test
+train_2_ <- train_test_split(data_2)$train
+test_2_ <- train_test_split(data_2)$test
+
+```
+
+# model 1
+
+## cox regression model
+
+```{r}
+# set.seed(22)
+# # train/test prep
+# x_train <- data.matrix(train_1_[,!names(train_1_) %in% c("time","status")])
+# x_test <- data.matrix(test_1_[,!names(test_1_) %in% c("time","status")])
+# 
+# y_train_cox <- Surv(train_1_$time, train_1_$status)
+# y_test_cox <- Surv(test_1_$time, test_1_$status)
+# 
+# # add weights
+# # Y <- as.matrix(train_$status)
+# # fraction <- numeric(2)
+# # for (i in 0:1) {
+# #   fraction[i+1] <- 1 - sum(Y == i) / nrow(Y)
+# # }
+# # weights <- numeric(nrow(Y))
+# # for (i in 0:1) {
+# #   weights[Y == i] <- fraction[i+1]
+# # }
+# 
+# # perform k-fold cross-validation to find optimal lambda value
+# #cox_cv_model <- cv.glmnet(x_train, y_train_cox, family = "cox", weights = weights, type.measure = "C")
+# cox_cv_model <- cv.glmnet(x_train, y_train_cox, family = "cox", type.measure = "C")
+# 
+# # find optimal lambda value that minimizes test binomial deviance
+# print(paste("best_lambda: ", cox_cv_model$lambda.min))
+# 
+# # produce plot of test C-index by lambda value
+# plot(cox_cv_model)
+# title("Cross-validation Error Plot", line = 2)
+# 
+# # find coefficients of best model
+# cox_model <- glmnet(x_train, y_train_cox, family = "cox", lambda = cox_cv_model$lambda.min)
+# #coef(cox_model)
+# 
+# cox_coef <- coef(cox_model)
+# cox_coef <- as.data.frame(cox_coef[, !is.na(cox_coef@Dimnames[1])])
+# cox_coef['feature'] <- rownames(cox_coef)
+# 
+# # path
+# plot(cox_cv_model$glmnet.fit, "lambda", label = FALSE)
+# title("Coefficient Plot", line = 2)
+# 
+# # assess
+# assess.glmnet(cox_model, newx = x_train, newy = y_train_cox)
+# assess.glmnet(cox_model, newx = x_test, newy = y_test_cox)
+```
+
+```{r}
+# # obtain prediction results
+# cox_pred_train <- predict(cox_model, s = cox_cv_model$lambda.min, newx = x_train, type = "response")
+# cox_pred_test <- predict(cox_model, s = cox_cv_model$lambda.min, newx = x_test, type = "response")
+# cox_pred_train <- as.data.frame(cox_pred_train)
+# colnames(cox_pred_train) <- "cox_pred"
+# cox_pred_test <- as.data.frame(cox_pred_test)
+# colnames(cox_pred_test) <- "cox_pred"
+# 
+# train_check <- cbind(train, cox_pred_train)
+# train_check['GROUP'] <- 'train'
+# test_check <- cbind(test, cox_pred_test)
+# test_check['GROUP'] <- 'test'
+# all_check <- rbind(train_check, test_check)
+# 
+# # output results
+# write.xlsx(all_check, paste(out_folder, "cox_prediction.xlsx", sep = "/"))
+# write.xlsx(cox_coef, paste(out_folder, "cox_coef.xlsx", sep = "/"))
+```
+
+## random forest model
+
+```{r}
+# o <- tune(status ~ ., data = train_)
+# o$optimal
+```
+
+### train the forest
+
+```{r}
+set.seed(22)
+# train the forest 
+rf_clinical <- rfsrc(Surv(time, status) ~ ., data = train_1_, ntree = 1000, importance = TRUE) 
+rf_clinical
+```
+
+### prediction
+
+```{r}
+# prediction
+pred_clinical <- predict(rf_clinical, test_1_)
+pred_clinical
+```
+
+### extract predicted results
+
+```{r}
+# # survival functions (IB and OOB)
+# obj_surv <- obj$survival.oob
+# obj_surv <- as.data.frame(cbind(train_1_$PATIENT_ID, obj_surv))
+# 
+# pred_surv <- pred$survival
+# pred_surv <- as.data.frame(cbind(test_1_$PATIENT_ID, pred_surv))
+# 
+# # cumulative hazard function (IB and OOB)
+# obj_chf <- obj$chf.oob
+# obj_chf <- as.data.frame(cbind(train_1_$PATIENT_ID, obj_chf))
+# 
+# pred_chf <- pred$chf
+# pred_chf <- as.data.frame(cbind(test_1_$PATIENT_ID, pred_chf))
+
+# mortality
+# obj_mor <- obj$predicted.oob
+# obj_mor <- as.data.frame(cbind(train_1_$PATIENT_ID, obj_mor))
+# 
+# pred_mor <- pred$predicted
+# pred_mor <- as.data.frame(cbind(test_1_$PATIENT_ID, pred_mor))
+```
+
+### some plots
+
+```{r}
+# plot
+par(cex.lab = 0.01, cex.axis = 1.5, cex.main = 1.5, cex.sub = 1.5)
+plot.rfsrc(rf_clinical, plots.one.page = FALSE)
+```
+
+```{r}
+gg_dta <- gg_vimp(rf_clinical, nvar = 50)
+plot(gg_dta)
+```
+
+```{r}
+# par(mar=c(4,4,3,3))
+# plot.variable.rfsrc(obj, plots.per.page = 3)
+# plot.variable.rfsrc(obj, plots.per.page = 3, surv.type = "surv")
+# plot.variable.rfsrc(obj, plots.per.page = 3, surv.type = "chf")
+```
+
+```{r}
+#par(mar=c(4,4,2,2))
+# plot.survival.rfsrc(rf_clinical)
+# plot.survival.rfsrc(pred_clinical)
+```
+
+# model 2
+
+```{r}
+clinical_feature <- gsub("\\-", ".", colnames(clinical))
+clinical_feature <- gsub("\\ ", ".", clinical_feature)
+
+train_2_ <- train_2_[,!names(train_2_) %in% clinical_feature]
+test_2_ <- test_2_[,!names(test_2_) %in% clinical_feature]
+```
+
+## cox regression model
+
+```{r}
+set.seed(22)
+# train/test prep
+x_train <- data.matrix(train_2_[,!names(train_2_) %in% c("time","status")])
+x_test <- data.matrix(test_2_[,!names(test_2_) %in% c("time","status")])
+
+y_train_cox <- Surv(train_2_$time, train_2_$status)
+y_test_cox <- Surv(test_2_$time, test_2_$status)
+
+# add weights
+# Y <- as.matrix(train_2_$status)
+# fraction <- numeric(2)
+# for (i in 0:1) {
+#   fraction[i+1] <- 1 - sum(Y == i) / nrow(Y)
+# }
+# weights <- numeric(nrow(Y))
+# for (i in 0:1) {
+#   weights[Y == i] <- fraction[i+1]
+# }
+
+cox_cv_model <- cv.glmnet(x_train, y_train_cox, family = "cox", type.measure = "C")
+
+# find optimal lambda value that minimizes test binomial deviance
+print(paste("best_lambda: ", cox_cv_model$lambda.min))
+
+# produce plot of test C-index by lambda value
+plot(cox_cv_model)
+title("Cross-validation Error Plot", line = 2)
+
+# find coefficients of best model
+cox_mut_cna <- glmnet(x_train, y_train_cox, family = "cox", lambda = cox_cv_model$lambda.min)
+#coef(cox_mut_cna)
+
+cox_coef <- coef(cox_mut_cna)
+cox_coef <- as.data.frame(cox_coef[, !is.na(cox_coef@Dimnames[1])])
+cox_coef['feature'] <- rownames(cox_coef)
+
+# path
+plot(cox_cv_model$glmnet.fit, "lambda", label = FALSE)
+title("Coefficient Plot", line = 2)
+
+# assess
+assess.glmnet(cox_mut_cna, newx = x_train, newy = y_train_cox)
+assess.glmnet(cox_mut_cna, newx = x_test, newy = y_test_cox)
+```
+
+```{r}
+# # obtain prediction results
+# cox_pred_train <- predict(cox_model, s = cox_cv_model$lambda.min, newx = x_train, type = "response")
+# cox_pred_test <- predict(cox_model, s = cox_cv_model$lambda.min, newx = x_test, type = "response")
+# cox_pred_train <- as.data.frame(cox_pred_train)
+# colnames(cox_pred_train) <- "cox_pred"
+# cox_pred_test <- as.data.frame(cox_pred_test)
+# colnames(cox_pred_test) <- "cox_pred"
+# 
+# train_check <- cbind(train_2_, cox_pred_train)
+# train_check['GROUP'] <- 'train'
+# test_check <- cbind(test_2_, cox_pred_test)
+# test_check['GROUP'] <- 'test'
+# all_check <- rbind(train_check, test_check)
+# 
+# # output results
+# write.xlsx(all_check, paste(out_folder, "cox_prediction_2.xlsx", sep = "/"))
+# write.xlsx(cox_coef, paste(out_folder, "cox_coef_2.xlsx", sep = "/"))
+```
+
+## random forest model
+
+### train the forest
+
+```{r}
+# set.seed(22)
+# # train the forest
+# rf <- rfsrc(Surv(time, status) ~ ., data = train_2_, ntree = 1000, importance = TRUE)
+# rf
+```
+
+### prediction
+
+```{r}
+# # prediction
+# pred <- predict(rf, test_2_)
+# pred
+```
+
+### extract predicted results
+
+```{r}
+# # survival functions (IB and OOB)
+# rf_surv <- rf$survival.oob
+# rf_surv <- as.data.frame(cbind(train$PATIENT_ID, rf_surv))
+# 
+# pred_surv <- pred$survival
+# pred_surv <- as.data.frame(cbind(test$PATIENT_ID, pred_surv))
+# 
+# # cumulative hazard function (IB and OOB)
+# rf_chf <- rf$chf.oob
+# rf_chf <- as.data.frame(cbind(train$PATIENT_ID, rf_chf))
+# 
+# pred_chf <- pred$chf
+# pred_chf <- as.data.frame(cbind(test$PATIENT_ID, pred_chf))
+```
+
+### some plots
+
+```{r}
+# # plot
+# par(cex.lab = 0.01, cex.axis = 1.5, cex.main = 1.5, cex.sub = 1.5)
+# plot.rfsrc(rf, plots.one.page = FALSE)
+```
+
+```{r}
+#par(mar=c(4,4,2,2))
+# plot.survival.rfsrc(rf)
+# plot.survival.rfsrc(pred)
+```
+
+# voting ensemble
+
+```{r}
+# en_1: clinical features
+en_1 <- data_2 |>
+  select(all_of(colnames(clinical))) |>
+  mutate(status=RELAPSE_5_YR) |>
+  mutate(time=DAYS_TO_EVENT) |>
+  select(-all_of(col_remove))
+
+colnames(en_1) <- gsub("\\-", ".", colnames(en_1))
+colnames(en_1) <- gsub("\\ ", ".", colnames(en_1))
+
+# en_2: mutation and cna features
+en_2 <- data_2 |>
+  mutate(status=RELAPSE_5_YR) |>
+  mutate(time=DAYS_TO_EVENT) |>
+  select(-all_of(colnames(clinical)))
+
+colnames(en_2) <- gsub("\\-", ".", colnames(en_2))
+colnames(en_2) <- gsub("\\ ", ".", colnames(en_2))
+```
+
+## model 1 pred
+
+```{r}
+en_1_pred <- predict(rf_clinical, en_1)
+en_1_pred
+```
+
+```{r}
+data_2$model_mortality <- en_1_pred$predicted
+```
+
+## model 2 pred
+
+```{r}
+x_en <- select(en_2, -time, -status)
+x_en <- data.frame(lapply(x_en, factor))
+x_en <- data.matrix(x_en)
+
+
+y_en <- Surv(en_2$time, en_2$status)
+
+en_2_pred <- predict(cox_mut_cna, s = cox_cv_model$lambda.min, newx = x_en, type = "response")
+
+assess.glmnet(cox_mut_cna, newx = x_en, newy = y_en)
+```
+
+```{r}
+data_2$model_risk <- en_2_pred[,1]
+```
+
+```{r}
+en_2_pred <- predict(rf, en_2)
+en_2_pred
+```
+```{r}
+data_2$model_mortality_2 <- en_2_pred$predicted
+```
+
+
+```{r}
+#write.xlsx(data_2, paste(out_folder, "data_2_pred.xlsx", sep = '/'))
+```
+
+```{r}
+cindex_list <- list()
+for (i in seq(0.1,0.9,length=9)){
+  data_2$predicted_mortality <- data_2$model_mortality*i + data_2$model_mortality_2*(1-i)
+  cindex <- concordance.index(x = data_2$predicted_mortality, 
+                              surv.time = data_2$DAYS_TO_EVENT, 
+                              surv.event = data_2$RELAPSE_5_YR, 
+                              method = "noether")
+  cindex_list <- append(cindex_list, list(cindex$c.index))
+}
+
+data_2$predicted_mortality <- data_2$model_mortality*0.1 + data_2$model_mortality_2*0.9
+```
+
+
+# patient risk groups
+
+```{r}
+# graph comparing groups
+group <- data_2 |>
+  mutate(Group = if_else((model_mortality > 20 & model_risk < 15), "Low", if_else((model_mortality >= 20 & model_risk >= 30), "High", "Moderate"))) |>
+  mutate(Color = if_else((model_mortality > 20 & model_risk < 15), "#8b97b4", if_else((model_mortality >= 20 & model_risk >= 30), "#536a26", "#a6c668")))
+```
+
+```{r}
+surv <- en_1_pred$survival
+colnames(surv) <- en_1_pred$time.interest
+```
+
+```{r}
+# graph comparing groups
+col <- colnames(surv)
+
+plot(as.numeric(col), surv[1,], type = 'n',
+     pch = 16,
+     col = "black",
+     xlab = "Time(Days)",
+     ylab = "Prob",
+     main = "Predicted No Relapse Probabilities",
+     ylim = c(0, 1))
+
+for (i in 1:nrow(surv)) {
+  points(as.numeric(col), surv[i,], pch = 15, col = group$Color[i], cex = 0.25)
+}
+
+table(group$Group)
+
+```
+
+```{r}
+# graph comparing actual status
+surv_status <- data.frame(status = data_2$FIRST_EVENT)
+surv_status$Color <- if_else(surv_status$status=="Relapse", "#fb9ccd", "#a6c699")
+
+plot(as.numeric(1:ncol(surv)), surv[1,], type = 'n',
+     pch = 16,
+     col = "black",
+     xlab = "Ranked Time",
+     ylab = "Prob",
+     main = "Predicted No Relapse Probabilities",
+     ylim = c(0, 1))
+
+for (i in 1:nrow(surv)) {
+  points(as.numeric(1:ncol(surv)), surv[i,], pch = 15, col = surv_status$Color[i], cex = 0.25)
+}
+
+legend(x = "bottomleft", legend=c("Yes", "No"), 
+       fill = c("#fb9ccd","#a6c699"), 
+       title = "If had relapse",
+       bty = "n",
+       text.font = 3)
+
+```
+
+```{r}
+write.xlsx(group, paste(out_folder, "data_2_pred_group.xlsx", sep = '/'))
+```
+
